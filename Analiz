@@ -1,0 +1,369 @@
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import as_completed
+from datetime import datetime
+from itertools import product
+from tqdm import tqdm
+import pandas as pd
+import requests
+import time
+import csv
+import os
+
+# Determine the number of cores in the CPU
+NUM_CORES = os.cpu_count()
+
+#________________________________________________________________________________________________________
+
+# Parameters for convenient changes
+# Main parameters:
+TICKER = "SOLUSDT"
+TIMEFRAME = "1h"
+PRICE_TYPE = "open_price"  # Change to "close_price" or "middle_price" as desired
+COMMISSION_PERCENT = 0.0  # Percentage of commission per trade (for example, 0.1%)
+
+# Strategy settings:
+DELTA_PERCENT = 2.75  # Delta from the forecast as a percentage for buying
+TAKE_PROFIT_PERCENT = 20.0  # Percentage of take profit from the purchase price
+
+STOP_LOSS_PERCENT = 1.5  # Dynamic stop loss percentage
+AutoOPTIMISATION = "False"  # Automatic parameter optimization
+ANALYZE_CANDLE_MAX_MIN = True  # can be True, False, "STOP_LOSS" or "TAKE_PROFIT"
+
+# Parameters for setting a corridor when opening a deal:
+UPPER_BOUNDARY_PERCENT = 2.0  # Percentage above current price to set upper limit
+LOWER_BOUNDARY_PERCENT = 7.5  # Percentage below current price to set lower bound
+
+#________________________________________________________________________________________________________
+
+# Call to Binance
+BASE_URL = "https://api.binance.com/api/v3/klines"
+params = {
+    "symbol": TICKER,
+    "interval": TIMEFRAME,
+    "limit": 1000
+}
+
+def format_time(timestamp_millis):
+    timestamp = timestamp_millis / 1000
+    dt_object = datetime.fromtimestamp(timestamp)
+    return dt_object
+
+def load_forecasts(filepath):
+    forecasts = {}
+
+    if filepath.endswith(".csv"):
+        with open(filepath, 'r') as f:
+            reader = csv.reader(f, delimiter=';')
+            for row in reader:
+                year, month, day, hour = int(row[0][:2]), int(row[0][2:4]), int(row[0][4:6]), int(row[0][6:8])
+                date = datetime(year=2000 + year, month=month, day=day, hour=hour)
+                forecast_values = list(map(float, row[1].split(',')))
+                forecasts[date] = forecast_values
+    elif filepath.endswith(".xlsx"):
+        forecast_data = pd.read_excel(filepath, header=None)
+        for index, row in forecast_data.iterrows():
+            timestamp = str(row[0])
+            year, month, day, hour = int(timestamp[:2]), int(timestamp[2:4]), int(timestamp[4:6]), int(timestamp[6:8])
+            date = datetime(year=2000 + year, month=month, day=day, hour=hour)
+            forecast_values = list(map(float, row[1].split(',')))
+            forecasts[date] = forecast_values
+    else:
+        print("Unsupported file format. Please provide a .csv or .xlsx file.")
+
+    return forecasts
+
+def load_forecasts_from_excel(filepath):
+    print("Loading forecasts from Excel...")
+    df = pd.read_excel(filepath)
+
+    forecasts = {}
+    for index, row in df.iterrows():
+        year, month, day, hour = int(row[0][:2]), int(row[0][2:4]), int(row[0][4:6]), int(row[0][6:8])
+        date = datetime(year=2000 + year, month=month, day=day, hour=hour)
+        forecast_values = list(map(float, row[1].split(',')))
+        forecasts[date] = forecast_values
+
+    print("Forecasts loaded successfully.")
+    return forecasts
+
+
+def get_data_from_binance(forecasts):
+    all_data = []
+    unique_dates = list(forecasts.keys())
+    start_date = unique_dates[0]
+    end_date = unique_dates[-1]
+
+    # Determine the duration of a time interval based on TIMEFRAME
+    time_multiplier = int(TIMEFRAME[:-1])
+    time_unit = TIMEFRAME[-1]
+
+    time_units_in_milliseconds = {
+        's': 1000,
+        'm': 60 * 1000,
+        'h': 60 * 60 * 1000,
+        'd': 24 * 60 * 60 * 1000
+    }
+
+    interval_milliseconds = time_units_in_milliseconds[time_unit] * time_multiplier
+
+    current_start_time = int(start_date.timestamp() * 1000)
+    final_end_time = int(end_date.timestamp() * 1000 + 5 * interval_milliseconds)
+
+    # Calculate the total number of requests to set the total range for tqdm
+    total_intervals = (final_end_time - current_start_time) // interval_milliseconds
+    total_requests = -(-total_intervals // 1000)
+
+    progress_bar = tqdm(total=total_requests, desc="Downloading data from Binance", position=0, leave=True)
+
+    while current_start_time < final_end_time:
+        params["startTime"] = current_start_time
+        params["endTime"] = min(current_start_time + 1000 * interval_milliseconds, final_end_time)
+
+        response = requests.get(BASE_URL, params=params)
+        if response.status_code != 200:
+            error_message = f"Ошибка при выполнении запроса. Код ответа: {response.status_code}. Текст ответа: {response.text}"
+            print(error_message)
+            return []
+
+        data = response.json()
+        all_data.extend(data)
+
+        # Update startTime for the next request
+        current_start_time = params["endTime"] + 1
+
+        # Update the loading indicator
+        progress_bar.update(1)
+
+    progress_bar.close()
+
+    formatted_data = [
+        {'open_time': format_time(k[0]), 'open_price': float(k[1]), 'high_price': float(k[2]), 'low_price': float(k[3]),
+         'close_price': float(k[4]),
+         'middle_price': (float(k[1]) + float(k[4])) / 2} for k in all_data]
+
+    filtered_data = [candle for candle in formatted_data if
+                     any(is_within_forecast_period(candle['open_time'], forecast_time) for forecast_time in forecasts)]
+    return filtered_data
+
+def is_within_forecast_period(time, forecast_time):
+    delta = time - forecast_time
+    return 0 <= delta.total_seconds() < 5 * 3600  #5 hours in seconds
+
+def trade_strategy(data, forecasts, delta_percent, stop_loss_percent):
+    balance = 1000.0
+    initial_balance = balance
+    in_trade = False
+    within_boundary = False
+    buy_price = 0.0
+    upper_boundary = 0.0
+    lower_boundary = 0.0
+    max_price_after_buy = 0.0
+    buy_amount_after_commission = 0.0
+    logs = []
+    trade_logs = []
+
+    for i in range(len(data) - 1):
+        current_candle = data[i][PRICE_TYPE]
+        forecast_date = data[i]['open_time']
+
+        closest_hour = datetime(forecast_date.year, forecast_date.month, forecast_date.day, forecast_date.hour)
+        if closest_hour in forecasts:
+            forecast_values = forecasts[closest_hour]
+            deltas = [((forecast - current_candle) / current_candle) * 100 for forecast in forecast_values]
+            min_delta, max_delta = min(deltas), max(deltas)
+        else:
+            continue
+
+        min_forecast, max_forecast = forecast_values[deltas.index(min_delta)], forecast_values[deltas.index(max_delta)]
+        logs.append(f"Date: {data[i]['open_time']}, Real Price: {current_candle:.2f}, Min Forecast: {min_forecast:.2f}, Max Forecast: {max_forecast:.2f}, Min Delta: {min_delta:.2f}%, Max Delta: {max_delta:.2f}%")
+
+        if not in_trade and not within_boundary and max_delta > delta_percent:
+            buy_amount = 0.3 * balance
+            buy_amount_after_commission = buy_amount * (1 - COMMISSION_PERCENT / 100)
+            buy_price = current_candle
+            upper_boundary = buy_price * (1 + UPPER_BOUNDARY_PERCENT / 100)
+            lower_boundary = buy_price * (1 - LOWER_BOUNDARY_PERCENT / 100)
+            within_boundary = True
+            balance -= buy_amount
+            max_price_after_buy = buy_price
+
+            message = f"Date: {forecast_date}, Buying at Price: {buy_price:.2f}, Upper Boundary: {upper_boundary:.2f}, Lower Boundary: {lower_boundary:.2f}, Balance: {balance:.2f}"
+            logs.append(message)
+            trade_logs.append(message)
+
+        if within_boundary:
+            next_candle = data[i + 1][PRICE_TYPE]
+            if next_candle < lower_boundary:
+                sell_amount = buy_amount_after_commission * (next_candle / buy_price) * (1 - COMMISSION_PERCENT / 100)
+                balance += sell_amount
+                within_boundary = False
+                in_trade = False
+                message = f"Date: {data[i + 1]['open_time']}, Selling at Price: {next_candle:.2f} (Exit from lower boundary), Balance: {balance:.2f}"
+                logs.append(message)
+                trade_logs.append(message)
+                buy_price = 0.0
+                max_price_after_buy = 0.0
+            elif next_candle > upper_boundary:
+                within_boundary = False
+                in_trade = True
+                message = f"Date: {data[i + 1]['open_time']}, Activating main trading logic (Exit from upper boundary)"
+                logs.append(message)
+                trade_logs.append(message)
+
+        if in_trade:
+            next_candle = data[i + 1][PRICE_TYPE]
+            candle_max = data[i]['high_price']
+            candle_min = data[i]['low_price']
+
+            stop_loss_triggered = ANALYZE_CANDLE_MAX_MIN in [True, "STOP_LOSS"] and candle_min < (1 - stop_loss_percent / 100) * max_price_after_buy
+            take_profit_triggered = ANALYZE_CANDLE_MAX_MIN in [True, "TAKE_PROFIT"] and candle_max > buy_price * (1 + TAKE_PROFIT_PERCENT / 100)
+
+            if next_candle > max_price_after_buy:
+                stop_loss_level = (1 - stop_loss_percent / 100) * next_candle
+                message = f"Date: {data[i + 1]['open_time']}, Updated Stop Loss Price: from {next_candle:.2f} - to {stop_loss_level:.2f}"
+                logs.append(message)
+                trade_logs.append(message)
+                max_price_after_buy = next_candle
+
+            if stop_loss_triggered or take_profit_triggered:
+                sell_amount = buy_amount_after_commission * (next_candle / buy_price) * (1 - COMMISSION_PERCENT / 100)
+                balance += sell_amount
+                in_trade = False
+                reason = "Stop Loss" if stop_loss_triggered else "Take Profit"
+                message = f"Date: {data[i + 1]['open_time']}, Selling at Price: {next_candle:.2f} (Triggered by {reason}), Balance: {balance:.2f}"
+                logs.append(message)
+                trade_logs.append(message)
+                buy_price = 0.0
+                max_price_after_buy = 0.0
+
+    if in_trade or within_boundary:
+        final_candle = data[-1][PRICE_TYPE]
+        sell_amount = buy_amount_after_commission * (final_candle / buy_price) * (1 - COMMISSION_PERCENT / 100)
+        balance += sell_amount
+        message = f"Date: {data[-1]['open_time']}, Forced Selling at Price: {final_candle:.2f}, Balance: {balance:.2f}"
+        logs.append(message)
+        trade_logs.append(message)
+
+    logs.append("")
+    logs.append("Процесс торговли:")
+    logs.append("")
+    logs.extend(trade_logs)  # Add trading logs to the main logs before displaying the final balance
+    percent_change = ((balance - initial_balance) / initial_balance) * 100
+    logs.append(f"Final Balance: {balance:.2f}, Change: {percent_change:.2f}%")
+
+    return balance, logs
+
+def split_range(data_range, num_parts):
+    length = len(data_range)
+    base_size = length // num_parts
+    extra = length % num_parts
+
+    partitions = []
+    start = 0
+    for i in range(num_parts):
+        end = start + base_size + (1 if i < extra else 0)
+        partitions.append(data_range[start:end])
+        start = end
+
+    return partitions
+
+def optimize_parameters_partial(args):
+    data, forecasts, param_pairs = args
+    best_balance = -float('inf')
+    best_delta = None
+    best_stop_loss = None
+    optimization_logs = []
+
+    for delta, stop_loss in param_pairs:
+        balance, _ = trade_strategy(data, forecasts, delta, stop_loss)
+        optimization_logs.append(f"DELTA: {delta:.2f}, STOP_LOSS: {stop_loss:.2f}, BALANCE: {balance:.2f}")
+        if balance > best_balance:
+            best_balance = balance
+            best_delta = delta
+            best_stop_loss = stop_loss
+
+    return best_balance, best_delta, best_stop_loss, optimization_logs
+
+def optimize_parameters(data, forecasts):
+    delta_partitions = split_range(delta_range, NUM_CORES)
+
+    # Create a Cartesian product for each part of delta_range with the whole stop_loss_range
+    combined_partitions = [list(product(delta_part, stop_loss_range)) for delta_part in delta_partitions]
+
+    # Create a list of arguments for each function call
+    args_list = [(data, forecasts, part) for part in combined_partitions]
+
+    # Let's run optimization in parallel on each range
+    with ProcessPoolExecutor() as executor:
+        futures = [executor.submit(optimize_parameters_partial, arg) for arg in args_list]
+
+        # Use as_completed to update progress gradually
+        progress_bar = tqdm(total=NUM_CORES, desc="Optimizing Parameters", position=0, leave=True)
+        results = []
+        for future in as_completed(futures):
+            result = future.result()
+            results.append(result)
+            progress_bar.update(1)
+        progress_bar.close()
+
+    # Combine all logs from different subranges
+    all_logs = []
+    for _, _, _, optimization_logs in results:
+        all_logs.extend(optimization_logs)
+
+    best_result = max(results, key=lambda x: x[0])
+
+    return best_result[1], best_result[2], all_logs
+
+def save_logs_to_file(logs, filename="logs.txt"):
+    with open(filename, "w") as file:
+        for log in logs:
+            file.write(log + "\n")
+
+def save_optimization_logs_to_file(logs, filename="optimization_logs.txt"):
+    with open(filename, "w") as file:
+        for log in logs:
+            file.write(log + "\n")
+
+
+if __name__ == '__main__':
+    start_time = time.time()
+    logs = []
+
+    # Specify the file name to download
+    forecast_file = "forecast.xlsx"
+
+    # Determine the file extension to select the correct download function
+    file_extension = os.path.splitext(forecast_file)[1]
+    if file_extension in [".csv", ".xlsx"]:
+        forecasts = load_forecasts(forecast_file)
+    else:
+        raise ValueError("Unsupported file format.")
+
+    logs.append("Forecasts loaded.")
+    data = get_data_from_binance(forecasts)
+    logs.append("Data loaded from Binance.")
+
+
+    delta_range = [i / 10 for i in range(1, 100)]  # "i / 10" = 0.1% step. "range"(1, 50) = range from 0.1% to 5%
+    stop_loss_range = [i / 10 for i in range(1, 100)]  # "i / 10" = 0.1% step. "range"(1, 50) = range from 0.1% to 5%
+
+    optimized_params_message = ""
+
+    if AutoOPTIMISATION == "True":
+        best_delta, best_stop_loss, optimization_logs = optimize_parameters(data, forecasts)
+        DELTA_PERCENT = best_delta
+        STOP_LOSS_PERCENT = best_stop_loss
+        optimized_params_message = f"Optimized Parameters: DELTA_PERCENT = {best_delta}, STOP_LOSS_PERCENT = {best_stop_loss}"
+        logs.append(optimized_params_message)
+        save_optimization_logs_to_file(optimization_logs)
+
+    final_balance, log_messages = trade_strategy(data, forecasts, DELTA_PERCENT, STOP_LOSS_PERCENT)
+
+    logs.extend(log_messages)
+
+    # Save all messages to a file
+    save_logs_to_file(logs)
+
+    end_time = time.time()  # End of time measurement
+    print(f"Total execution time: {end_time - start_time:.2f} seconds.")
