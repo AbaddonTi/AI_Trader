@@ -1,0 +1,179 @@
+import csv
+import logging
+import requests
+import xlsxwriter
+import pandas as pd
+from datetime import datetime
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+# Options
+TICKER = "BTCUSDT"
+TIMEFRAME = "1h"
+
+def convert_to_unix_timestamp(time_str):
+    """Converts a timestamp string to a Unix timestamp."""
+    if len(time_str) == 10:  # If format is YYMMDDHHMM
+        dt = datetime.strptime(time_str, "%y%m%d%H%M")
+    else:  # Default to format YYMMDDHH
+        dt = datetime.strptime(time_str, "%y%m%d%H")
+    return int(dt.timestamp() * 1000)
+
+def average(numbers):
+    return sum(numbers) / len(numbers)
+
+def read_data_from_file(file_path):
+    if file_path.endswith('.csv'):
+        timestamps = []
+        raw_forecasts = []
+        with open(file_path, "r") as file:
+            reader = csv.reader(file, delimiter=";")
+            for row in reader:
+                timestamps.append(row[0])
+                forecast_values = [float(value) for value in row[1].split(",")]
+                raw_forecasts.append(forecast_values)
+        return timestamps, raw_forecasts
+    elif file_path.endswith('.xlsx'):
+        df = pd.read_excel(file_path)
+        # Convert the timestamps to string
+        timestamps = df.iloc[:, 0].astype(str).tolist()
+        raw_forecasts = [list(map(float, str(row).split(","))) for row in df.iloc[:, 1]]
+        return timestamps, raw_forecasts
+    else:
+        raise ValueError("Unsupported file format")
+
+def adjust_timestamps(timestamps):
+    """Adjust the timestamp list based on the provided logic."""
+    adjusted_timestamps = []
+    for i in range(len(timestamps)):
+        # If it's the last timestamp or if the current timestamp is not equal to the next one
+        if i == len(timestamps) - 1 or timestamps[i] != timestamps[i+1]:
+            adjusted_time = timestamps[i] + "30"
+            logging.info(f"Adjusted timestamp {timestamps[i]} to {adjusted_time}")
+            adjusted_timestamps.append(adjusted_time)
+        else:
+            adjusted_time = timestamps[i] + "00"
+            logging.info(f"Adjusted timestamp {timestamps[i]} to {adjusted_time}")
+            adjusted_timestamps.append(adjusted_time)
+    return adjusted_timestamps
+
+
+# Replace with the path to your file
+input_file_path = "forecast_BTC_1h_1.xlsx"
+timestamps, raw_forecasts = read_data_from_file(input_file_path)
+
+start_time = convert_to_unix_timestamp(timestamps[0])
+end_time = convert_to_unix_timestamp(timestamps[-1]) + 5 * 60 * 60 * 1000
+
+BASE_URL = "https://api.binance.com/api/v3/klines"
+params = {
+    "symbol": TICKER,
+    "interval": TIMEFRAME,
+    "startTime": start_time,
+    "endTime": end_time,
+    "limit": 1000
+}
+
+response = requests.get(BASE_URL, params=params)
+data = response.json()
+
+# If the response is empty, use the adjust_timestamps function and then request the data again
+if not data:
+    adjusted_timestamps = adjust_timestamps(timestamps)
+    start_time = convert_to_unix_timestamp(adjusted_timestamps[0])
+    end_time = convert_to_unix_timestamp(adjusted_timestamps[-1]) + 5 * 60 * 60 * 1000
+    params["startTime"] = start_time
+    params["endTime"] = end_time
+    response = requests.get(BASE_URL, params=params)
+    data = response.json()
+def format_time(timestamp_millis):
+    timestamp = timestamp_millis / 1000
+    dt_object = datetime.fromtimestamp(timestamp)
+    return dt_object
+
+times = [format_time(entry[0]) for entry in data]
+prices = [round(float(entry[1]), 2) for entry in data]
+average_forecasts = [None] + [average(forecast) for forecast in raw_forecasts]
+
+# Get the minimum length from all lists
+min_length = min(len(times), len(prices), len(average_forecasts))
+
+# Trim all lists to the minimum length
+times = times[:min_length]
+prices = prices[:min_length]
+average_forecasts = average_forecasts[:min_length]
+
+# Create a DataFrame
+df = pd.DataFrame()
+df['Time'] = times
+df['Binance Price'] = prices
+df['Average Forecast'] = average_forecasts
+
+# Adding predictions in order
+for idx in range(5):
+    forecast_column = [None] * (idx + 1) + [forecast[idx] if len(forecast) > idx else None for forecast in raw_forecasts]
+    forecast_column = forecast_column[:min_length]
+    df[f'Forecast {idx+1}'] = forecast_column
+
+# Convert 'Time' column to datetime64 format
+df['Time'] = pd.to_datetime(df['Time'])
+
+# Create a new Excel file
+workbook = xlsxwriter.Workbook('output_with_chart.xlsx', {'nan_inf_to_errors': True})
+
+# Add a data sheet
+data_worksheet = workbook.add_worksheet('Data')
+
+# Write data to the Data sheet
+for col_num, value in enumerate(df.columns.values):
+    data_worksheet.write(0, col_num, value)
+
+# Convert the 'Time' column to string format before writing
+df['Time'] = df['Time'].astype(str)
+
+for row_num, row_data in enumerate(df.values):
+    for col_num, col_data in enumerate(row_data):
+        if pd.isna(col_data):
+            data_worksheet.write(row_num + 1, col_num, "")
+        else:
+            data_worksheet.write(row_num + 1, col_num, col_data)
+
+
+# Create a new sheet for the chart
+chart_worksheet = workbook.add_worksheet('Chart')
+
+# Let's collect all the values from the columns 'Binance Price', 'Average Forecast', и 'Forecast 1' ... 'Forecast 5'
+all_values = df['Binance Price'].dropna().tolist() + df['Average Forecast'].dropna().tolist()
+for i in range(1, 6):
+    all_values += df[f'Forecast {i}'].dropna().tolist()
+
+# Find the maximum and minimum values
+max_value = max(all_values)
+min_value = min(all_values)
+
+# Find the maximum and minimum values
+y_max = max_value * 1.01
+y_min = min_value * 0.99
+
+# Create a new graph
+chart = workbook.add_chart({'type': 'line'})
+
+# Setting up the chart: adding each of the lines
+for i in range(1, 8):  # 7 линий: цена + средний прогноз + 5 прогнозов
+    chart.add_series({
+        'name':       ['Data', 0, i],
+        'categories': ['Data', 1, 0, min_length + 1, 0],
+        'values':     ['Data', 1, i, min_length + 1, i],
+    })
+
+# Set the minimum and maximum values for the Y axis
+chart.set_y_axis({'min': y_min, 'max': y_max})
+
+# Set graph size
+chart.set_size({'width': 2200, 'height': 700})  # Изменил высоту на 400
+
+# Insert a chart into the Chart sheet
+chart_worksheet.insert_chart('A3', chart)  # График начнется с ячейки A3
+
+workbook.close()
