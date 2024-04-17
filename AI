@@ -9,7 +9,7 @@ from datetime import datetime
 from tqdm import tqdm
 import os
 
-lines_to_remove = 2160  # например, удалить последние 10 строк 
+lines_to_remove = 2160  # for example, remove last 10 lines
 
 class TimeSeriesDataset(torch.utils.data.Dataset):
     def __init__(self, X, y):
@@ -39,7 +39,7 @@ class MultiheadSelfAttention(nn.Module):
 
     def __init__(self, d_model, num_heads):
         super(MultiheadSelfAttention, self).__init__()
-        # «Количество головок должно быть фактором размера модели»
+        # "The number of heads should be a factor of the model size"
         assert d_model % num_heads == 0, "Number of heads must be a factor of the model dimension"
 
         self.d_model = d_model
@@ -67,13 +67,13 @@ class MultiheadSelfAttention(nn.Module):
         key = self.split_heads(self.fc_key(x))
         value = self.split_heads(self.fc_value(x))
 
-        # Вычислить скалярное произведение внимания (в масштабе)
+        # Calculate dot product of attention (scaled)
         scores = torch.matmul(query, key.transpose(-2, -1)) / (self.d_k ** 0.5)
         attn_weights = self.softmax(scores)
         attn_weights = self.dropout(attn_weights)
         context = torch.matmul(attn_weights, value)
 
-        # Объединяем головы и проходим через выходной линейный слой
+        # Merge the heads and pass through the output line layer
         context = self.combine_heads(context)
         output = self.fc_out(context)
         return output
@@ -135,6 +135,7 @@ class TemporalFusionTransformer(nn.Module):
 
         x = self.fc_out(x)
         return x
+
 def train_tft_model(model, train_loader, val_loader, num_epochs, learning_rate, device):
     model.to(device)
     # Define the optimizer and loss function
@@ -215,7 +216,7 @@ def fetch_complete_historical_data(symbol, timeframe):
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
     df.dropna(inplace=True)
 
-    # Сохраняем в файл "Тикер_Таймфрейм_Датасоздания_History"
+    # Save to the file "Ticker_Timeframe_Date of Creation_History"
     creation_date = datetime.now().strftime("%Y%m%d")
     output_file = f"{symbol.split('/')[0]}_{timeframe}_{creation_date}_History.csv"
     df.to_csv(output_file, index=False)
@@ -225,16 +226,16 @@ def fetch_complete_historical_data(symbol, timeframe):
 
 
 def filter_date_ranges(df, date_ranges):
-    """
-    Фильтрация датафрейма на основе заданных интервалов дат.
+     """
+     Filtering a dataframe based on specified date intervals.
 
-    Parameters:
-    - df: датафрейм, который нужно отфильтровать.
-    - date_ranges: список кортежей, где каждый кортеж содержит начальную и конечную даты интервала.
+     Parameters:
+     - df: dataframe to filter.
+     - date_ranges: a list of tuples, where each tuple contains the start and end dates of the range.
 
-    Returns:
-    - отфильтрованный датафрейм.
-    """
+     Returns:
+     - filtered dataframe.
+     """
     mask = np.full(df.shape[0], False)  # начальная маска (все значения False)
 
     for start_date, end_date in date_ranges:
@@ -253,7 +254,7 @@ def remove_last_lines_from_csv(filename, lines_to_remove):
 
 def remove_duplicates_from_csv(filename):
     df = pd.read_csv(filename)
-    # Удаление дубликатов по столбцу timestamp (или другому уникальному столбцу)
+    # Removing duplicates by timestamp column (or other unique column)
     df.drop_duplicates(subset='timestamp', inplace=True)
     df.to_csv(filename, index=False)
 
@@ -296,7 +297,7 @@ def load_and_preprocess_data(filename):
     df.to_csv("./df_1h_sol.csv", index=False)
 
     train_df, val_df, pred_df, c = df[-40000:], df[:7314], df[-100:], df[-10:]
-    # Добавляем проверку типов
+    # Add type checking
     print(type(pred_df))
     print(type(c))
 
@@ -355,10 +356,10 @@ def get_last_date_from_csv(filename):
     df = pd.read_csv(filename)
     last_date = df['timestamp'].iloc[-1]
 
-    # Преобразование строки в объект datetime
+    # Convert a string to a datetime object
     last_date_dt = datetime.strptime(last_date, "%Y-%m-%d %H:%M:%S")
 
-    # Форматирование даты в требуемый формат
+    # Formatting the date into the required format
     formatted_date = last_date_dt.strftime('%y%m%d%H')
 
     return formatted_date
@@ -380,38 +381,38 @@ if __name__ == "__main__":
     symbol = "BTC/USDT"
     timeframe = "1h"
 
-    # Получение полной истории данных
+    # Retrieving complete data history
     main_file = fetch_complete_historical_data(symbol, timeframe)
 
-    # Загрузка данных в датафрейм и фильтрация по нужным датам
+    # Loading data into a dataframe and filtering by desired dates
     df = pd.read_csv(main_file)
     df['timestamp'] = pd.to_datetime(df['timestamp'])
     df.set_index('timestamp', inplace=True)
 
-    # Определение интервалов дат для сохранения
+    # Define date intervals for saving
     date_ranges_to_keep = [('2019-09-30', '2020-10-26'), ('2022-06-06', datetime.now().strftime('%Y-%m-%d'))]
 
-    # Фильтрация датафрейма на основе интервалов дат
+    # Filter a dataframe based on date ranges
     filtered_df = filter_date_ranges(df, date_ranges_to_keep)
 
-    # Сохранение отфильтрованного датафрейма обратно в файл
+    # Saving the filtered dataframe back to a file
     filtered_file = "filtered_" + main_file
     filtered_df.to_csv(filtered_file)
 
     while lines_to_remove > 0:
-        # Создаем дубликат основного файла перед каждым проходом
+        # Create a duplicate of the main file before each pass
         duplicated_file = "sol_historical_data_1h_last.csv"
         shutil.copy(filtered_file, duplicated_file)
         print(f"Created duplicated data: {duplicated_file}")
 
-        # Удалите последние строки из дублированного файла
+        # Remove last lines from duplicate file
         remove_last_lines_from_csv(duplicated_file, lines_to_remove)
         lines_to_remove -= 1
         remove_duplicates_from_csv(duplicated_file)
 
         train, val, pred, min_val, max_val = load_and_preprocess_data(duplicated_file)
 
-        # Создание входных и выходных последовательностей
+        # Create input and output sequences
         input_seq_len = 50
         output_seq_len = 5
         X_train, y_train = generate_sliding_window(train, input_seq_len, output_seq_len)
@@ -437,28 +438,28 @@ if __name__ == "__main__":
         model = TemporalFusionTransformer(num_inputs, num_outputs, d_model, num_heads, num_blocks, dropout_rate)
         model, val_loss = train_tft_model(model, train_loader, val_loader, num_epochs, learning_rate, device)
 
-        # Получение прогнозов и сохранение их в Excel
+        # Receiving forecasts and saving them in Excel
         predictions, dates = get_forecasts(model, pred_loader, device, min_val, max_val)
         last_date = get_last_date_from_csv(duplicated_file)
 
-        # Если файл уже существует, вставляйте новые прогнозы в конец файла
+        # If the file already exists, insert new predictions at the end of the file
         filename = f"forecast_{symbol.split('/')[0]}_{timeframe}_{len(predictions)}.xlsx"
         if os.path.exists(filename):
-            # Загрузите существующие данные без заголовков
+            # Load existing data without headers
             existing_df = pd.read_excel(filename, header=None)
 
             new_df = pd.DataFrame({
-                0: [last_date for _ in predictions],  # Изменим имя столбца на 0, так как мы не используем заголовки
-                1: [','.join(map(str, pred)) for pred in predictions]  # Изменим имя столбца на 1
+                0: [last_date for _ in predictions],  # Change the column name to 0 since we are not using headers
+                1: [','.join(map(str, pred)) for pred in predictions]  # Change the column name to 1
             })
 
-            # Объедините существующий DataFrame и новый DataFrame по вертикали
+            # Merge the existing DataFrame and the new DataFrame vertically
             final_df = pd.concat([existing_df, new_df], ignore_index=True)
 
-            # Сохраните объединенный DataFrame в файл Excel без заголовков
+            # Save the combined DataFrame to an Excel file without headers
             final_df.to_excel(filename, index=False, header=False)
         else:
             save_to_excel(symbol.split('/')[0], timeframe, predictions, dates, last_date)
 
-    end_time = time.time()  # Конец измерения времени
+    end_time = time.time()  # End of time measurement
     print(f"Total execution time: {end_time - start_time:.2f} seconds.")
